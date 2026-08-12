@@ -24,46 +24,51 @@ jobs:
         with:
           go-version: "1.21"
           cache: false
+      - name: Resolve a POSIX temp path
+        # git-bash's GNU tar reads the "D:" in RUNNER_TEMP as a remote host
+        # spec ("Cannot connect to D: resolve failed"), so every path handed to
+        # a unix tool goes through cygpath first.
+        run: echo "TMPU=$(cygpath -u "$RUNNER_TEMP")" >> "$GITHUB_ENV"
       - name: Build buildkitd/buildctl from the patched tree
         env:
           GOFLAGS: -mod=vendor
         run: |
           set -eux
-          mkdir -p "$RUNNER_TEMP/bin"
-          go build -o "$RUNNER_TEMP/bin/buildkitd.exe" ./cmd/buildkitd
-          go build -o "$RUNNER_TEMP/bin/buildctl.exe" ./cmd/buildctl
+          mkdir -p "$TMPU/bin"
+          go build -o "$TMPU/bin/buildkitd.exe" ./cmd/buildkitd
+          go build -o "$TMPU/bin/buildctl.exe" ./cmd/buildctl
       - name: Install containerd (CONTAINERD_VERSION from the repo Dockerfile)
         run: |
           set -eux
-          curl -fsSL -o "$RUNNER_TEMP/containerd.tgz" \
+          curl -fsSL -o "$TMPU/containerd.tgz" \
             https://github.com/containerd/containerd/releases/download/v1.7.18/containerd-1.7.18-windows-amd64.tar.gz
-          mkdir -p "$RUNNER_TEMP/ctrd"
-          tar xzf "$RUNNER_TEMP/containerd.tgz" -C "$RUNNER_TEMP/ctrd"
-          find "$RUNNER_TEMP/ctrd" -name '*.exe' -exec cp {} "$RUNNER_TEMP/bin/" \;
-          ls -l "$RUNNER_TEMP/bin"
+          mkdir -p "$TMPU/ctrd"
+          tar xzf "$TMPU/containerd.tgz" -C "$TMPU/ctrd"
+          find "$TMPU/ctrd" -name '*.exe' -exec cp {} "$TMPU/bin/" \;
+          ls -l "$TMPU/bin"
       - name: Build registry.exe (REGISTRY_VERSION from the repo Dockerfile)
         run: |
           set -eux
-          gp="$RUNNER_TEMP/gopath"
+          gp="$TMPU/gopath"
           mkdir -p "$gp/src/github.com/docker"
           git clone -q --depth 1 -b v2.8.3 https://github.com/distribution/distribution.git \
             "$gp/src/github.com/docker/distribution"
           cd "$gp/src/github.com/docker/distribution"
-          GO111MODULE=off GOPATH="$gp" CGO_ENABLED=0 go build -o "$RUNNER_TEMP/bin/registry.exe" ./cmd/registry
-          ls -l "$RUNNER_TEMP/bin/registry.exe"
+          GO111MODULE=off GOPATH="$gp" CGO_ENABLED=0 go build -o "$TMPU/bin/registry.exe" ./cmd/registry
+          ls -l "$TMPU/bin/registry.exe"
       - name: Probe harness prerequisites
         run: |
           set -eux
-          export PATH="$RUNNER_TEMP/bin:$PATH"
+          export PATH="$TMPU/bin:$PATH"
           buildkitd.exe --version
           containerd.exe --version
           registry.exe --version || true
-          ls "$RUNNER_TEMP/bin"
+          ls "$TMPU/bin"
       - name: Integration ${{ matrix.pkg }} worker=containerd
         env:
           GOFLAGS: -mod=vendor
           TMPDIR: ${{ runner.temp }}
         run: |
           set -eux
-          export PATH="$RUNNER_TEMP/bin:$PATH"
+          export PATH="$TMPU/bin:$PATH"
           go test -v -timeout 60m -parallel 2 -run '//worker=containerd$' ${{ matrix.pkg }}
