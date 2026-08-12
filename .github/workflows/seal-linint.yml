@@ -1,0 +1,80 @@
+name: seal-linint
+
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        worker:
+          - oci
+          - containerd
+        pkg:
+          - ./client
+          - ./cmd/buildctl
+          - ./solver
+          - ./frontend
+          - ./frontend/dockerfile
+        include:
+          - worker: containerd
+            pkg: ./worker/containerd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: false
+      - name: Install integration prerequisites
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/bin"
+          go build -o "$RUNNER_TEMP/bin/buildkitd" ./cmd/buildkitd
+          go build -o "$RUNNER_TEMP/bin/buildctl" ./cmd/buildctl
+          ctr=$(docker create registry:2)
+          docker cp "$ctr:/bin/registry" "$RUNNER_TEMP/bin/registry"
+          docker rm "$ctr"
+          chmod 0755 "$RUNNER_TEMP/bin/registry"
+          runc --version
+          containerd --version
+      - name: Install CNI + dnsmasq for the workers
+        run: |
+          set -eux
+          sudo mkdir -p /opt/cni/bin /etc/buildkit
+          curl -fsSL https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz \
+            | sudo tar xz -C /opt/cni/bin
+          sudo cp hack/fixtures/cni.json /etc/buildkit/cni.json
+          sudo cp hack/fixtures/dns-cni.conflist /etc/buildkit/dns-cni.conflist
+          sudo apt-get install -y -qq dnsmasq >/dev/null
+          sudo systemctl stop dnsmasq || true
+      - name: Probe ${{ matrix.pkg }} worker=${{ matrix.worker }}
+        run: |
+          set -uxo pipefail
+          log="$RUNNER_TEMP/probe.log"
+          start=$SECONDS
+          sudo -E env "PATH=$RUNNER_TEMP/bin:$PATH" "GOFLAGS=-mod=vendor" \
+            "BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS=1" \
+            go test -v -timeout 110m -parallel 2 -run "//worker=${{ matrix.worker }}\$" ${{ matrix.pkg }} 2>&1 | tee "$log" | tail -1 || true
+          echo "=== elapsed: $((SECONDS-start))s"
+          echo "=== pass=$(grep -cE -- '--- PASS' "$log" || true) fail=$(grep -cE -- '--- FAIL' "$log" || true) skip=$(grep -cE -- '--- SKIP' "$log" || true)"
+          echo "=== no-tests-to-run: $(grep -c 'no tests to run' "$log" || true)"
+          echo "=== FAILURES ==="
+          grep -E -- '--- FAIL' "$log" || echo "(none)"
+      - name: Upload probe log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/probe.log
+          if-no-files-found: warn
