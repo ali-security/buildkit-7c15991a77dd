@@ -266,8 +266,19 @@ func Git(url, ref string, opts ...GitOption) State {
 		// for different protocols (e.g. https and ssh) that have the same
 		// host/path/fragment combination.
 		id = remote.Host + path.Join("/", remote.Path)
-		if ref != "" {
-			id += "#" + ref
+		// The fragment may carry a subdirectory ("<ref>:<subdir>"). Normalize
+		// it so that it can never point outside of the repository root.
+		fragment := ref
+		if r, subdir, ok := strings.Cut(fragment, ":"); ok {
+			subdir = path.Join("/", subdir)
+			subdir = strings.TrimPrefix(subdir, "/")
+			fragment = r
+			if subdir != "" {
+				fragment += ":" + subdir
+			}
+		}
+		if fragment != "" {
+			id += "#" + fragment
 		}
 	}
 

@@ -48,6 +48,44 @@ func TestParseURL(t *testing.T) {
 			},
 		},
 		{
+			// the subdir can never escape the repository root
+			url: "http://github.com/moby/buildkit#v1.0.0:../../escape",
+			result: GitURL{
+				Scheme:   HTTPProtocol,
+				Host:     "github.com",
+				Path:     "/moby/buildkit",
+				Fragment: &GitURLFragment{Ref: "v1.0.0", Subdir: "escape"},
+			},
+		},
+		{
+			url: "http://github.com/moby/buildkit#v1.0.0:subdir/../../../escape",
+			result: GitURL{
+				Scheme:   HTTPProtocol,
+				Host:     "github.com",
+				Path:     "/moby/buildkit",
+				Fragment: &GitURLFragment{Ref: "v1.0.0", Subdir: "escape"},
+			},
+		},
+		{
+			// an absolute subdir is made relative to the repository root
+			url: "http://github.com/moby/buildkit#v1.0.0:/etc/passwd",
+			result: GitURL{
+				Scheme:   HTTPProtocol,
+				Host:     "github.com",
+				Path:     "/moby/buildkit",
+				Fragment: &GitURLFragment{Ref: "v1.0.0", Subdir: "etc/passwd"},
+			},
+		},
+		{
+			url: "http://github.com/moby/buildkit#v1.0.0:..",
+			result: GitURL{
+				Scheme:   HTTPProtocol,
+				Host:     "github.com",
+				Path:     "/moby/buildkit",
+				Fragment: &GitURLFragment{Ref: "v1.0.0"},
+			},
+		},
+		{
 			url: "http://foo:bar@github.com/moby/buildkit#v1.0.0",
 			result: GitURL{
 				Scheme:   HTTPProtocol,

@@ -543,6 +543,179 @@ func testSubdir(t *testing.T, keepGitDir bool) {
 	require.Equal(t, "abc\n", string(dt))
 }
 
+// TestSubdirEscape checks that a subdir attempting to escape the repository
+// root, either with a relative traversal or with an absolute path, is clamped
+// to the repository root instead of reaching outside of the checkout.
+func TestSubdirEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+
+	for _, subdir := range []string{"../../sub", "/sub", "sub/../../../sub"} {
+		subdir := subdir
+		t.Run(subdir, func(t *testing.T) {
+			ctx := logProgressStreams(context.Background(), t)
+
+			gs := setupGitSource(t, t.TempDir())
+
+			repodir := t.TempDir()
+
+			runShell(t, repodir,
+				"git -c init.defaultBranch=master init",
+				"git config --local user.email test",
+				"git config --local user.name test",
+				"echo foo > abc",
+				"mkdir sub",
+				"echo abc > sub/bar",
+				"git add abc sub",
+				"git commit -m initial",
+			)
+
+			repoURL := serveGitRepo(t, repodir)
+			id := &GitIdentifier{Remote: repoURL, Subdir: subdir}
+
+			g, err := gs.Resolve(ctx, id, nil, nil)
+			require.NoError(t, err)
+
+			_, _, _, done, err := g.CacheKey(ctx, nil, 0)
+			require.NoError(t, err)
+			require.True(t, done)
+
+			ref1, err := g.Snapshot(ctx, nil)
+			require.NoError(t, err)
+			defer ref1.Release(context.TODO())
+
+			mount, err := ref1.Mount(ctx, true, nil)
+			require.NoError(t, err)
+
+			lm := snapshot.LocalMounter(mount)
+			dir, err := lm.Mount()
+			require.NoError(t, err)
+			defer lm.Unmount()
+
+			fis, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			require.Equal(t, 1, len(fis))
+
+			dt, err := os.ReadFile(filepath.Join(dir, "bar"))
+			require.NoError(t, err)
+			require.Equal(t, "abc\n", string(dt))
+		})
+	}
+}
+
+// TestSubdirSymlink checks that a subdir that resolves to a symlink is
+// rejected, so that a repository can not redirect the checkout to a location
+// outside of itself.
+func TestSubdirSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Depends on unimplemented containerd bind-mount support on Windows")
+	}
+
+	t.Parallel()
+
+	ctx := logProgressStreams(context.Background(), t)
+
+	gs := setupGitSource(t, t.TempDir())
+
+	// a directory outside of the repository that the committed symlink points at
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "keepthissecret")
+	require.NoError(t, os.WriteFile(secret, []byte("secret\n"), 0600))
+
+	repodir := t.TempDir()
+
+	runShell(t, repodir,
+		"git -c init.defaultBranch=master init",
+		"git config --local user.email test",
+		"git config --local user.name test",
+		"echo foo > abc",
+		"ln -s "+outside+" sub",
+		"git add abc sub",
+		"git commit -m initial",
+	)
+
+	repoURL := serveGitRepo(t, repodir)
+	id := &GitIdentifier{Remote: repoURL, Subdir: "sub"}
+
+	g, err := gs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	_, _, _, done, err := g.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+	require.True(t, done)
+
+	_, err = g.Snapshot(ctx, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid subdir")
+
+	// the contents outside of the repository must be left untouched
+	_, err = os.Stat(secret)
+	require.NoError(t, err)
+}
+
+func TestValidateDirsOnly(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "sub", "dir"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "sub", "file"), []byte("data\n"), 0600))
+
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "secret"), []byte("secret\n"), 0600))
+
+	// the repository root itself is always valid
+	require.NoError(t, validateDirsOnly(root, ""))
+	require.NoError(t, validateDirsOnly(root, "."))
+	require.NoError(t, validateDirsOnly(root, string(filepath.Separator)))
+
+	// plain directories are valid
+	require.NoError(t, validateDirsOnly(root, "sub"))
+	require.NoError(t, validateDirsOnly(root, filepath.Join("sub", "dir")))
+	require.NoError(t, validateDirsOnly(root, string(filepath.Separator)+filepath.Join("sub", "dir")))
+
+	// a regular file is not a directory
+	err := validateDirsOnly(root, filepath.Join("sub", "file"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-directory")
+
+	// a path below a regular file is rejected on the file component
+	err = validateDirsOnly(root, filepath.Join("sub", "file", "more"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-directory")
+
+	// paths that do not exist are rejected
+	require.Error(t, validateDirsOnly(root, "nonexistent"))
+
+	// parent traversal never leaves the root
+	require.Error(t, validateDirsOnly(root, ".."))
+	require.Error(t, validateDirsOnly(root, filepath.Join("..", filepath.Base(outside))))
+	require.Error(t, validateDirsOnly(root, filepath.Join("sub", "..", "..", filepath.Base(outside))))
+
+	if runtime.GOOS == "windows" {
+		// creating symlinks requires extra privileges on Windows
+		return
+	}
+
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "link")))
+	require.NoError(t, os.Symlink(filepath.Join(root, "sub", "dir"), filepath.Join(root, "sub", "linkdir")))
+
+	// a symlink is never a valid component, even when it points at a directory
+	err = validateDirsOnly(root, "link")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-directory")
+
+	err = validateDirsOnly(root, filepath.Join("link", "secret"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-directory")
+
+	err = validateDirsOnly(root, filepath.Join("sub", "linkdir"))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-directory")
+}
+
 func setupGitSource(t *testing.T, tmpdir string) source.Source {
 	snapshotter, err := native.NewSnapshotter(filepath.Join(tmpdir, "snapshots"))
 	require.NoError(t, err)
