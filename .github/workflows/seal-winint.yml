@@ -68,7 +68,21 @@ jobs:
         env:
           GOFLAGS: -mod=vendor
           TMPDIR: ${{ runner.temp }}
+          # git-bash rewrites a leading "//" argument into a Windows path
+          # before go sees it, so the selector silently matched nothing and the
+          # job passed with "[no tests to run]".
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
-          set -eux
+          set -euxo pipefail
           export PATH="$TMPU/bin:$PATH"
-          go test -v -timeout 60m -parallel 2 -run '//worker=containerd$' ${{ matrix.pkg }}
+          log="$TMPU/winint.log"
+          go test -v -timeout 60m -parallel 2 -run '//worker=containerd$' ${{ matrix.pkg }} 2>&1 | tee "$log"
+          # An empty selector is a green tick that proves nothing -- assert
+          # tests actually ran.
+          if grep -q 'no tests to run' "$log"; then
+            echo "::error::selector matched no tests"; exit 1
+          fi
+          ran=$(grep -cE -- '--- (PASS|FAIL)' "$log" || true)
+          echo "tests run: $ran"
+          if [ "$ran" -lt 1 ]; then echo "::error::no tests ran"; exit 1; fi
