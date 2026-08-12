@@ -8,23 +8,7 @@ concurrency:
   cancel-in-progress: true
 
 on:
-  push:
-    branches:
-      - 'master'
-      - 'v[0-9]*'
-    paths:
-      - '.github/workflows/docs-upstream.yml'
-      - 'docs/buildkitd.toml.md'
-      - 'docs/attestations/slsa-definitions.md'
-      - 'docs/attestations/attestation-storage.md'
-      - 'frontend/dockerfile/docs/reference.md'
-  pull_request:
-    paths:
-      - '.github/workflows/docs-upstream.yml'
-      - 'docs/buildkitd.toml.md'
-      - 'docs/attestations/slsa-definitions.md'
-      - 'docs/attestations/attestation-storage.md'
-      - 'frontend/dockerfile/docs/reference.md'
+  workflow_dispatch:
 
 jobs:
   validate:

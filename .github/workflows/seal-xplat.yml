@@ -1,0 +1,287 @@
+name: seal-xplat
+
+on:
+  workflow_dispatch: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: false
+      - name: Compile gate
+        env:
+          GOFLAGS: -mod=vendor
+        run: go build ./...
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/helper"
+          cat > "$RUNNER_TEMP/helper/create_mod.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$RUNNER_TEMP/helper"
+          go mod init example.com/mod
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.17.0
+          GOFLAGS=-mod=mod go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Verify checkout carries no untracked junk
+        run: |
+          set -eux
+          git status --porcelain
+          untracked=$(git ls-files --others --exclude-standard)
+          echo "untracked: [$untracked]"
+          test -z "$untracked"
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          "$RUNNER_TEMP/create_mod" github.com/moby/buildkit v0.14.1 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.14.1.zip"
+          ls -l "$RUNNER_TEMP/out/v0.14.1.zip"
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.14.1.zip
+          if-no-files-found: error
+
+  test-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: false
+      - name: Install registry binary for worker mirror tests
+        run: |
+          set -eux
+          ctr=$(docker create registry:2)
+          docker cp "$ctr:/bin/registry" "$RUNNER_TEMP/registry"
+          docker rm "$ctr"
+          sudo install -m 0755 "$RUNNER_TEMP/registry" /usr/local/bin/registry
+          ls -l /usr/local/bin/registry
+      - name: Test
+        run: sudo -E env "PATH=$PATH" "GOFLAGS=-mod=vendor" go test -short ./...
+
+  # The suites this job runs are exactly the ones the -short legs above skip:
+  # every integration.Run() bails out on testing.Short()
+  # (util/testutil/integration/run.go). They are the only worker-backed,
+  # end-to-end coverage of the two patched call paths -- the http source's
+  # save() and gateway-supplied container ids reaching the runc and containerd
+  # executors -- so they are run here unskipped, on both executors.
+  #
+  # Upstream drives these from a container image built by ./hack/test. That
+  # image no longer builds at this tag: its `go install gocovmerge@latest`
+  # resolves a golang.org/x/tools that now requires go >= 1.25, which the
+  # pinned go 1.21 base rejects (GOTOOLCHAIN=local). The harness itself only
+  # needs buildkitd plus a registry binary on PATH and root, so the same tests
+  # are driven directly on the runner instead.
+  test-integration-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: false
+      - name: Install integration prerequisites
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/bin"
+          # buildkitd is built from the patched tree: it is the daemon under
+          # test, and it is looked up in PATH by workers.InitOCIWorker /
+          # InitContainerdWorker (which also refuse to run as non-root).
+          go build -o "$RUNNER_TEMP/bin/buildkitd" ./cmd/buildkitd
+          go build -o "$RUNNER_TEMP/bin/buildctl" ./cmd/buildctl
+          ctr=$(docker create registry:2)
+          docker cp "$ctr:/bin/registry" "$RUNNER_TEMP/bin/registry"
+          docker rm "$ctr"
+          chmod 0755 "$RUNNER_TEMP/bin/registry"
+          # runc backs the oci worker, containerd + its runc shim back the
+          # containerd worker; both ship with the runner's docker install.
+          runc --version
+          containerd --version
+          containerd-shim-runc-v2 -v
+      - name: Install CNI bridge networking for the workers
+        run: |
+          set -eux
+          # Same CNI_VERSION and same config fixture the repo's own
+          # integration-tests image installs (Dockerfile ARG CNI_VERSION,
+          # hack/fixtures/cni.json -> /etc/buildkit/cni.json). Without it
+          # buildkitd logs "using host network as the default" and the
+          # netmode=default half of the gateway host-networking tests cannot
+          # tell a confined container from an unconfined one.
+          sudo mkdir -p /opt/cni/bin /etc/buildkit
+          curl -fsSL https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz \
+            | sudo tar xz -C /opt/cni/bin
+          sudo cp hack/fixtures/cni.json /etc/buildkit/cni.json
+      # One worker per `go test` invocation, as upstream's own matrix does.
+      # Both workers in a single binary means two buildkitd sandboxes, a
+      # containerd and the registry mirror competing on one runner, and the
+      # tty/exec tests then fail on context deadlines rather than on anything
+      # in the code under test.
+      - name: Integration - http source save() (CVE-2026-33747)
+        run: |
+          set -eux
+          for worker in oci containerd; do
+            sudo -E env "PATH=$RUNNER_TEMP/bin:$PATH" "GOFLAGS=-mod=vendor" \
+              go test -v -timeout 30m -parallel 2 -run "TestIntegration/TestBuildHTTPSource/worker=${worker}\$" ./client
+          done
+      - name: Integration - gateway container ids (CVE-2026-33747)
+        run: |
+          set -eux
+          for worker in oci containerd; do
+            sudo -E env "PATH=$RUNNER_TEMP/bin:$PATH" "GOFLAGS=-mod=vendor" \
+              "BUILDKIT_RUN_NETWORK_INTEGRATION_TESTS=1" \
+              go test -v -timeout 40m -parallel 2 -run "TestClientGatewayIntegration/.*/worker=${worker}\$" ./client
+          done
+      - name: Integration - git source subdir (CVE-2026-33748)
+        run: |
+          set -eux
+          for worker in oci containerd; do
+            sudo -E env "PATH=$RUNNER_TEMP/bin:$PATH" "GOFLAGS=-mod=vendor" \
+              go test -v -timeout 30m -parallel 2 -run "TestIntegration/TestDockerfileFromGit/worker=${worker}\$" ./frontend/dockerfile
+          done
+
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: false
+      - name: Test
+        env:
+          GOFLAGS: -mod=vendor
+        run: go test -short ./...
+
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # go.mod declares go 1.21, but the Go 1.21 darwin linker emits no
+          # LC_UUID, which modern macOS dyld rejects ("missing LC_UUID load
+          # command" -> abort trap) so every test binary dies before main().
+          # 1.23 is the first toolchain that emits it; language level is
+          # still pinned by the go directive in go.mod.
+          go-version: "1.23"
+          cache: false
+      - name: Test
+        env:
+          GOFLAGS: -mod=vendor
+        run: |
+          set -euo pipefail
+          # buildkit 0.14.1 has no darwin build for its containerd/overlay
+          # snapshotter stack: the dependencies of these packages are
+          # build-constrained off on darwin ("build constraints exclude all Go
+          # files in .../snapshots/overlay/overlayutils"), so they cannot even
+          # compile here. Upstream runs no macOS CI for this reason. Every one
+          # of them is compiled and tested by the linux and windows legs; only
+          # this unimplemented-on-darwin surface is dropped.
+          cat <<'SKIP' | sed 's/^[[:space:]]*//' | grep -v '^$' | LC_ALL=C sort > "$RUNNER_TEMP/skip.txt"
+          github.com/moby/buildkit/cache
+          github.com/moby/buildkit/cache/contenthash
+          github.com/moby/buildkit/cache/remotecache
+          github.com/moby/buildkit/cache/remotecache/azblob
+          github.com/moby/buildkit/cache/remotecache/gha
+          github.com/moby/buildkit/cache/remotecache/inline
+          github.com/moby/buildkit/cache/remotecache/local
+          github.com/moby/buildkit/cache/remotecache/registry
+          github.com/moby/buildkit/cache/remotecache/s3
+          github.com/moby/buildkit/cache/remotecache/v1
+          github.com/moby/buildkit/cache/util
+          github.com/moby/buildkit/client/llb/llbtest
+          github.com/moby/buildkit/cmd/buildkitd
+          github.com/moby/buildkit/control
+          github.com/moby/buildkit/control/gateway
+          github.com/moby/buildkit/executor/containerdexecutor
+          github.com/moby/buildkit/executor/oci
+          github.com/moby/buildkit/exporter
+          github.com/moby/buildkit/exporter/attestation
+          github.com/moby/buildkit/exporter/containerimage
+          github.com/moby/buildkit/exporter/local
+          github.com/moby/buildkit/exporter/oci
+          github.com/moby/buildkit/exporter/tar
+          github.com/moby/buildkit/exporter/util/epoch
+          github.com/moby/buildkit/frontend/dockerfile
+          github.com/moby/buildkit/frontend/gateway
+          github.com/moby/buildkit/frontend/gateway/container
+          github.com/moby/buildkit/frontend/gateway/forwarder
+          github.com/moby/buildkit/snapshot
+          github.com/moby/buildkit/snapshot/containerd
+          github.com/moby/buildkit/snapshot/imagerefchecker
+          github.com/moby/buildkit/solver/llbsolver
+          github.com/moby/buildkit/solver/llbsolver/file
+          github.com/moby/buildkit/solver/llbsolver/mounts
+          github.com/moby/buildkit/solver/llbsolver/ops
+          github.com/moby/buildkit/solver/llbsolver/ops/opsutils
+          github.com/moby/buildkit/solver/llbsolver/proc
+          github.com/moby/buildkit/source
+          github.com/moby/buildkit/source/containerimage
+          github.com/moby/buildkit/source/git
+          github.com/moby/buildkit/source/http
+          github.com/moby/buildkit/source/local
+          github.com/moby/buildkit/util/network/netproviders
+          github.com/moby/buildkit/worker
+          github.com/moby/buildkit/worker/base
+          github.com/moby/buildkit/worker/containerd
+          github.com/moby/buildkit/worker/tests
+          SKIP
+          go list -e ./... | LC_ALL=C sort > "$RUNNER_TEMP/all.txt"
+          LC_ALL=C comm -23 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/skip.txt" > "$RUNNER_TEMP/run.txt"
+          echo "--- not buildable on darwin, excluded ($(wc -l < "$RUNNER_TEMP/skip.txt")) ---"
+          cat "$RUNNER_TEMP/skip.txt"
+          echo "--- packages under test on darwin: $(wc -l < "$RUNNER_TEMP/run.txt") ---"
+          test -s "$RUNNER_TEMP/run.txt"
+          xargs go test -short < "$RUNNER_TEMP/run.txt"
