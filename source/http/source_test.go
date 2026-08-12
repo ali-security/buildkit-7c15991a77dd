@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -25,6 +26,63 @@ import (
 	"github.com/stretchr/testify/require"
 	bolt "go.etcd.io/bbolt"
 )
+
+func TestGetFileNameTraversal(t *testing.T) {
+	t.Parallel()
+
+	const urlStr = "http://example.com/dir/foo.txt"
+
+	// a filename provided by the client must never escape the target directory
+	require.Equal(t, "passwd", getFileName(urlStr, "../../../etc/passwd", nil))
+	require.Equal(t, "download", getFileName(urlStr, "../", nil))
+	require.Equal(t, "download", getFileName(urlStr, "..", nil))
+	require.Equal(t, "download", getFileName(urlStr, "evil\nname", nil))
+	require.Equal(t, "foo.txt", getFileName(urlStr, "", nil))
+
+	// the same applies to a filename returned by the server
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Content-Disposition", `attachment; filename="../../../etc/passwd"`)
+	require.Equal(t, "passwd", getFileName(urlStr, "", resp))
+
+	// and to the name derived from the URL
+	require.Equal(t, "download", getFileName("http://example.com/%2e%2e%2f", "", nil))
+}
+
+// TestHTTPSourceFilenameTraversal checks that a filename attribute that points
+// outside of the target directory can not be used to write the downloaded file
+// to an arbitrary location.
+func TestHTTPSourceFilenameTraversal(t *testing.T) {
+	t.Parallel()
+	ctx := context.TODO()
+
+	hs, err := newHTTPSource(t)
+	require.NoError(t, err)
+
+	server := httpserver.NewTestServer(map[string]httpserver.Response{
+		"/foo": {
+			Etag:    identity.NewID(),
+			Content: []byte("content1"),
+		},
+	})
+	defer server.Close()
+
+	id := &HTTPIdentifier{URL: server.URL + "/foo", Filename: "../../../pwned"}
+
+	h, err := hs.Resolve(ctx, id, nil, nil)
+	require.NoError(t, err)
+
+	_, _, _, _, err = h.CacheKey(ctx, nil, 0)
+	require.NoError(t, err)
+
+	ref, err := h.Snapshot(ctx, nil)
+	require.NoError(t, err)
+	defer ref.Release(context.TODO())
+
+	// the file is written inside the snapshot with the traversal stripped
+	dt, err := readFile(ctx, ref, "pwned")
+	require.NoError(t, err)
+	require.Equal(t, []byte("content1"), dt)
+}
 
 func TestHTTPSource(t *testing.T) {
 	t.Parallel()
